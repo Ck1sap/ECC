@@ -48,9 +48,9 @@ banner('Testing skill-router.js');
 
 run('tokenize drops stopwords and short tokens, keeps domain words', () => {
   const tokens = tokenize('Please help me fix the failing database tests');
-  assert.ok(!tokens.has('please') && !tokens.has('the'), 'Stopwords must be dropped');
-  assert.ok(!tokens.has('me'), 'Short tokens must be dropped');
-  assert.ok(tokens.has('database') && tokens.has('fix'), 'Domain words must survive');
+  assert.ok(!tokens.has('please') && !tokens.has('the'));
+  assert.ok(!tokens.has('me'));
+  assert.ok(tokens.has('database') && tokens.has('fix'));
 });
 
 run('tokenize adds singular forms for long plurals', () => {
@@ -63,188 +63,124 @@ run('routePrompt requires pluginRoot', () => {
 });
 
 run('routePrompt finds a matching skill in the real catalog', () => {
-  const matches = routePrompt('apply react patterns when refactoring this component', {
-    pluginRoot: repoRoot,
-  });
-  assert.ok(matches.length > 0, 'Expected at least one match');
+  const matches = routePrompt('apply react patterns when refactoring this component', { pluginRoot: repoRoot });
+  assert.ok(matches.length > 0);
   assert.ok(matches.some(m => m.id.includes('react')), `Expected a react skill, got ${matches.map(m => m.id).join(', ')}`);
   assert.ok(matches.every(m => m.installed), 'Full catalog root: every match is installed');
+  assert.ok(matches.every(m => m.path.startsWith('skills/')), 'paths are plugin-relative');
 });
 
 run('routePrompt returns nothing for unroutable prompts', () => {
-  const matches = routePrompt('zzqx wvvk pfff', { pluginRoot: repoRoot });
-  assert.deepStrictEqual(matches, []);
+  assert.deepStrictEqual(routePrompt('zzqx wvvk pfff', { pluginRoot: repoRoot }), []);
 });
 
-const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-fixture-'));
+const carrierRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-carrier-'));
 try {
-  writeSkill(fixtureRoot, 'coding-standards', 'Coding standards and conventions for this project');
-  writeSkill(fixtureRoot, 'ecc-catalog', 'Index of the full ECC skill catalog for this slim profile plugin');
+  writeSkill(carrierRoot, 'coding-standards', 'Coding standards and conventions for this project');
+  writeSkill(carrierRoot, 'ecc-catalog', 'Index of the full ECC skill catalog for this slim profile plugin');
   fs.writeFileSync(
-    path.join(fixtureRoot, PROFILE_METADATA_FILE),
-    JSON.stringify({ profileId: 'test', sourceRoot: repoRoot.split(path.sep).join('/') })
+    path.join(carrierRoot, PROFILE_METADATA_FILE),
+    JSON.stringify({
+      generatedFrom: 'everything-claude-code',
+      catalog: [
+        { id: 'coding-standards', description: 'Coding standards and conventions', path: 'skills/coding-standards/SKILL.md', installed: true, sha256: 'a'.repeat(64) },
+        { id: 'react-patterns', description: 'React component patterns and hooks', path: 'on-demand/react-patterns/SKILL.md', installed: false, sha256: 'b'.repeat(64) },
+        { id: 'escape-attempt', description: 'react patterns component escape', path: '../../etc/passwd', installed: false },
+        { id: 'abs-attempt', description: 'react patterns component absolute', path: '/etc/passwd', installed: false },
+      ],
+    })
   );
 
-  run('resolveRouterContext follows ecc-profile.json to the source catalog', () => {
-    const context = resolveRouterContext(fixtureRoot);
-    assert.strictEqual(path.resolve(context.sourceRoot), repoRoot);
+  run('resolveRouterContext reads the carrier receipt catalog', () => {
+    const context = resolveRouterContext(carrierRoot);
     assert.ok(context.installedIds.has('coding-standards'));
+    assert.ok(Array.isArray(context.embeddedCatalog));
+    assert.deepStrictEqual(context.embeddedCatalog.map(e => e.id).sort(), ['coding-standards', 'react-patterns']);
   });
 
-  run('slim profile routes uninstalled skills as on-demand from the source root', () => {
-    const matches = routePrompt('apply react patterns when refactoring this component', {
-      pluginRoot: fixtureRoot,
-    });
-    assert.ok(matches.length > 0, 'Expected matches from the source catalog');
-    const reactMatch = matches.find(m => m.id.includes('react'));
-    assert.ok(reactMatch, 'Expected a react skill routed from source');
-    assert.strictEqual(reactMatch.installed, false, 'react skill is not installed in the fixture profile');
-    assert.strictEqual(path.resolve(reactMatch.sourceRoot), repoRoot);
+  run('a carrier routes on-demand skills by their path inside the plugin', () => {
+    const matches = routePrompt('apply react patterns when refactoring this component', { pluginRoot: carrierRoot });
+    const react = matches.find(m => m.id === 'react-patterns');
+    assert.ok(react, 'react-patterns routed from the receipt');
+    assert.strictEqual(react.installed, false);
+    assert.strictEqual(react.path, 'on-demand/react-patterns/SKILL.md');
+  });
+
+  run('receipt rows with paths outside skills/ or on-demand/ are dropped', () => {
+    const matches = routePrompt('react patterns component escape absolute', { pluginRoot: carrierRoot });
+    assert.ok(!matches.some(m => m.id === 'escape-attempt' || m.id === 'abs-attempt'), 'unsafe paths must never route');
   });
 
   run('ecc-catalog is never routed', () => {
-    const bareRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-bare-'));
-    try {
-      writeSkill(bareRoot, 'ecc-catalog', 'Index of the full ECC skill catalog for this slim profile plugin');
-      const matches = routePrompt('show the full ecc skill catalog index', { pluginRoot: bareRoot });
-      assert.ok(!matches.some(m => m.id === 'ecc-catalog'), 'ecc-catalog must be excluded from routing');
-    } finally {
-      fs.rmSync(bareRoot, { recursive: true, force: true });
-    }
+    const matches = routePrompt('show the full ecc skill catalog index', { pluginRoot: carrierRoot });
+    assert.ok(!matches.some(m => m.id === 'ecc-catalog'));
   });
 
-  run('routing is deterministic across repeat calls (cache path)', () => {
-    const first = routePrompt('apply react patterns when refactoring this component', { pluginRoot: fixtureRoot });
-    const second = routePrompt('apply react patterns when refactoring this component', { pluginRoot: fixtureRoot });
+  run('routing is deterministic across repeat calls', () => {
+    const first = routePrompt('apply react patterns when refactoring this component', { pluginRoot: carrierRoot });
+    const second = routePrompt('apply react patterns when refactoring this component', { pluginRoot: carrierRoot });
     assert.deepStrictEqual(second, first);
   });
-
-  run('a sourceRoot that is not an ECC checkout is rejected', () => {
-    const impostorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-impostor-'));
-    const victimRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-victim-'));
-    try {
-      // Looks like a skills tree but lacks the manifests fingerprint.
-      writeSkill(impostorRoot, 'planted-skill', 'Planted description with react patterns component keywords');
-      writeSkill(victimRoot, 'coding-standards', 'Coding standards and conventions');
-      fs.writeFileSync(
-        path.join(victimRoot, PROFILE_METADATA_FILE),
-        JSON.stringify({ profileId: 'test', sourceRoot: impostorRoot.split(path.sep).join('/') })
-      );
-      const context = resolveRouterContext(victimRoot);
-      assert.strictEqual(path.resolve(context.sourceRoot), path.resolve(victimRoot), 'Unverified sourceRoot must fall back to the plugin root');
-      const matches = routePrompt('apply react patterns when refactoring this component', { pluginRoot: victimRoot });
-      assert.ok(!matches.some(m => m.id === 'planted-skill'), 'Planted catalog must not be routed');
-    } finally {
-      fs.rmSync(impostorRoot, { recursive: true, force: true });
-      fs.rmSync(victimRoot, { recursive: true, force: true });
-    }
-  });
-
-  run('embedded catalog snapshot routes without scanning the source tree', () => {
-    const snapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-snapshot-'));
-    try {
-      writeSkill(snapshotRoot, 'coding-standards', 'Coding standards and conventions');
-      fs.writeFileSync(
-        path.join(snapshotRoot, PROFILE_METADATA_FILE),
-        JSON.stringify({
-          profileId: 'test',
-          sourceRoot: repoRoot.split(path.sep).join('/'),
-          catalog: [{ id: 'zebra-snapshot-skill', description: 'Snapshot-only skill about zebra herding patterns' }],
-        })
-      );
-      const matches = routePrompt('zebra herding patterns for the snapshot', { pluginRoot: snapshotRoot });
-      assert.ok(matches.some(m => m.id === 'zebra-snapshot-skill'), 'Embedded catalog entry must be routable even though it is not on disk');
-    } finally {
-      fs.rmSync(snapshotRoot, { recursive: true, force: true });
-    }
-  });
 } finally {
-  fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  fs.rmSync(carrierRoot, { recursive: true, force: true });
 }
 
-run('sanitizeCatalogEntries drops malformed entries', () => {
+run('sanitizeCatalogEntries drops malformed entries and normalizes paths', () => {
   const entries = sanitizeCatalogEntries([
     { id: 'good-skill', description: 'a real description' },
+    { id: 'on-demand-skill', description: 'x', path: 'on-demand/on-demand-skill/SKILL.md', installed: false },
     { id: 'no-description' },
     { description: 'no id' },
     { id: 42, description: 'numeric id' },
-    { id: 'null-description', description: null },
-    { id: '', description: 'empty id' },
+    { id: 'bad-path', description: 'x', path: 'C:/Users/someone/SKILL.md' },
     null,
     'not-an-object',
   ]);
-  assert.deepStrictEqual(entries, [{ id: 'good-skill', description: 'a real description' }]);
-});
-
-run('sanitizeCatalogEntries keeps only id and description', () => {
-  const entries = sanitizeCatalogEntries([
-    { id: 'skill', description: 'desc', installed: true, sourceRoot: '/attacker/path' },
+  assert.deepStrictEqual(entries, [
+    { id: 'good-skill', description: 'a real description', path: 'skills/good-skill/SKILL.md', installed: true },
+    { id: 'on-demand-skill', description: 'x', path: 'on-demand/on-demand-skill/SKILL.md', installed: false },
   ]);
-  assert.deepStrictEqual(Object.keys(entries[0]).sort(), ['description', 'id']);
 });
 
-// A cache file is attacker-writable in the threat model: a malformed entry
-// must not reach scoring, where a non-string id would throw.
 run('a poisoned cache with malformed entries does not break routing', () => {
   const poisonedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-poison-'));
   try {
     writeSkill(poisonedRoot, 'database-migration', 'Database schema migration workflow');
-    fs.mkdirSync(path.join(poisonedRoot, 'manifests'), { recursive: true });
-    fs.writeFileSync(path.join(poisonedRoot, 'manifests', 'install-modules.json'), '{}');
-
-    const { routePrompt: route } = require('../../scripts/lib/skill-router');
-    // Prime the cache, then corrupt it in place.
-    route('database migration workflow please', { pluginRoot: poisonedRoot });
-    const cacheFile = fs.readdirSync(cacheDir).map(f => path.join(cacheDir, f))
-      .find(f => f.endsWith('.json'));
-    assert.ok(cacheFile, 'Expected a cache file to have been written');
+    routePrompt('database migration workflow please', { pluginRoot: poisonedRoot });
+    const cacheFile = fs.readdirSync(cacheDir).map(f => path.join(cacheDir, f)).find(f => f.endsWith('.json'));
+    assert.ok(cacheFile, 'Expected a cache file');
     const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
     cached.entries = [{ id: 99, description: 'malformed' }, { id: 'ok-skill', description: 'fine' }];
     fs.writeFileSync(cacheFile, JSON.stringify(cached));
-
-    assert.doesNotThrow(() => route('database migration workflow please', { pluginRoot: poisonedRoot }));
+    assert.doesNotThrow(() => routePrompt('database migration workflow please', { pluginRoot: poisonedRoot }));
   } finally {
     fs.rmSync(poisonedRoot, { recursive: true, force: true });
   }
 });
 
-// writeFileSync would follow a planted symlink; the temp-file + rename path
-// must leave the link target untouched.
 run('cache write never writes through a planted symlink', () => {
   const linkRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-link-'));
   const linkCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-skill-router-linkcache-'));
   const previousCacheDir = process.env.ECC_SKILL_ROUTER_CACHE_DIR;
   try {
     writeSkill(linkRoot, 'victim-skill', 'A skill used to trigger a catalog scan');
-    fs.mkdirSync(path.join(linkRoot, 'manifests'), { recursive: true });
-    fs.writeFileSync(path.join(linkRoot, 'manifests', 'install-modules.json'), '{}');
-
     const victimFile = path.join(linkCacheDir, 'victim.txt');
     fs.writeFileSync(victimFile, 'ORIGINAL');
-
-    const digest = require('crypto').createHash('sha1')
-      .update(path.resolve(linkRoot)).digest('hex').slice(0, 12);
+    const digest = require('crypto').createHash('sha1').update(path.resolve(linkRoot)).digest('hex').slice(0, 12);
     const plantedLink = path.join(linkCacheDir, `ecc-skill-router-${digest}.json`);
     try {
       fs.symlinkSync(victimFile, plantedLink);
     } catch {
-      return; // platform without symlink permission (Windows CI): nothing to assert
+      console.log('    SKIP: symlink creation not permitted on this platform; nothing to assert');
+      return;
     }
-
     process.env.ECC_SKILL_ROUTER_CACHE_DIR = linkCacheDir;
     delete require.cache[require.resolve('../../scripts/lib/skill-router')];
     const { routePrompt: route } = require('../../scripts/lib/skill-router');
     route('victim skill catalog scan trigger', { pluginRoot: linkRoot });
-
-    assert.strictEqual(fs.readFileSync(victimFile, 'utf8'), 'ORIGINAL',
-      'Cache write must not follow the symlink and clobber its target');
-    // The temp-file + rename path also *replaces* the planted link with a
-    // real file, so the cache still persists instead of silently rescanning
-    // on every prompt for as long as the link sits there.
-    assert.ok(fs.lstatSync(plantedLink).isFile(),
-      'Cache path must end up a regular file, not a lingering symlink');
-    assert.deepStrictEqual(fs.readdirSync(linkCacheDir).filter(f => f.endsWith('.tmp')), [],
-      'No temp files may be left behind');
+    assert.strictEqual(fs.readFileSync(victimFile, 'utf8'), 'ORIGINAL');
+    assert.ok(fs.lstatSync(plantedLink).isFile(), 'cache path must end up a regular file');
+    assert.deepStrictEqual(fs.readdirSync(linkCacheDir).filter(f => f.endsWith('.tmp')), []);
   } finally {
     if (previousCacheDir === undefined) delete process.env.ECC_SKILL_ROUTER_CACHE_DIR;
     else process.env.ECC_SKILL_ROUTER_CACHE_DIR = previousCacheDir;

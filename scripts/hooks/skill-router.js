@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 /**
- * Skill router hook (UserPromptSubmit)
+ * Skill router hook (UserPromptSubmit) - OPT-IN.
  *
  * Scores the submitted prompt against the skill catalog (offline token
  * matching via scripts/lib/skill-router.js) and, when skills clearly match,
- * emits a short routing note on stdout — which Claude Code injects as
- * context for the turn. Installed skills are suggested directly; skills
- * outside the active (slim) profile are suggested with their on-demand
- * SKILL.md path, so slim profile plugins keep the full catalog reachable.
+ * emits a short routing note on stdout - which Claude Code injects as
+ * context for the turn. Installed skills are suggested directly; skills a
+ * generated carrier holds on demand are suggested with their path inside the
+ * plugin.
+ *
+ * The router injects text into every matching turn, so it is off unless
+ * explicitly enabled: ECC_SKILL_ROUTER=1 (or the plugin option
+ * CLAUDE_PLUGIN_OPTION_SKILL_ROUTER=1). It is also bounded: if routing takes
+ * longer than ECC_SKILL_ROUTER_BUDGET_MS (default 150), it emits nothing.
  *
  * Exit code 0 always; empty stdout means "no routing opinion".
  */
@@ -20,53 +25,40 @@ const { routePrompt } = require('../lib/skill-router');
 const MAX_STDIN = 1024 * 1024;
 const MIN_PROMPT_LENGTH = 12;
 const MAX_DESCRIPTION_CHARS = 120;
+const DEFAULT_BUDGET_MS = 150;
 
-/**
- * Normalize a filesystem path to forward slashes for display.
- *
- * @param {string} anyPath Path in platform-native form.
- * @returns {string} Path with POSIX separators.
- */
-function toPosix(anyPath) {
-  return String(anyPath).split(path.sep).join('/');
+function isEnabled(env = process.env) {
+  const raw = env.ECC_SKILL_ROUTER !== undefined ? env.ECC_SKILL_ROUTER : env.CLAUDE_PLUGIN_OPTION_SKILL_ROUTER;
+  return ['1', 'true', 'yes', 'on'].includes(String(raw || '').trim().toLowerCase());
+}
+
+function budgetMs(env = process.env) {
+  const raw = Number(env.ECC_SKILL_ROUTER_BUDGET_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_BUDGET_MS;
 }
 
 /**
- * Flatten untrusted catalog text to a single safe line.
- *
- * Descriptions and ids reach this hook from SKILL.md frontmatter and from a
- * slim profile's ecc-profile.json catalog snapshot — plugin-supplied data
- * that lands directly in model context. A description carrying newlines,
- * carriage returns, or ANSI/C0 control bytes could otherwise forge extra
- * routing bullets or terminal escapes, so collapse all of it to spaces and
- * drop the control range entirely (Prompt Defense Baseline).
- *
- * @param {string} text Untrusted catalog text.
- * @returns {string} Single-line text with control characters removed.
+ * Flatten untrusted catalog text to a single safe line: collapse newlines
+ * and whitespace and drop C0/C1 control bytes so a description can never
+ * forge extra routing bullets or terminal escapes.
  */
 function sanitizeLine(text) {
   // eslint-disable-next-line no-control-regex
   return String(text || '').replace(/[\u0000-\u001F\u007F-\u009F]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/**
- * Render the routing note injected into the turn.
- *
- * @param {Array<object>} matches Scored matches from routePrompt().
- * @returns {string} Newline-terminated routing note.
- */
 function buildMessage(matches) {
-  const lines = ['[SkillRouter] Skills matching this prompt — use them if relevant:'];
+  const lines = ['[SkillRouter] Skills matching this prompt - use them if relevant:'];
   for (const match of matches) {
     const id = sanitizeLine(match.id);
+    const description = sanitizeLine(match.description);
+    const summary = description.length > MAX_DESCRIPTION_CHARS
+      ? `${description.slice(0, MAX_DESCRIPTION_CHARS - 3)}...`
+      : description;
     if (match.installed) {
-      const description = sanitizeLine(match.description);
-      const summary = description.length > MAX_DESCRIPTION_CHARS
-        ? `${description.slice(0, MAX_DESCRIPTION_CHARS - 3)}...`
-        : description;
       lines.push(`- ${id} (installed): ${summary}`);
     } else {
-      lines.push(`- ${id} (on demand): definition at ${sanitizeLine(toPosix(match.sourceRoot))}/skills/${id}/SKILL.md`);
+      lines.push(`- ${id} (on demand, read ${sanitizeLine(match.path)} inside this plugin): ${summary}`);
     }
   }
   return `${lines.join('\n')}\n`;
@@ -78,6 +70,11 @@ function buildMessage(matches) {
  * injected as context, so the raw-input echo fallback must never trigger.
  */
 function run(inputOrRaw, options = {}) {
+  const env = options.env || process.env;
+  if (!isEnabled(env)) {
+    return { exitCode: 0, stdout: '' };
+  }
+
   let input;
   try {
     input = typeof inputOrRaw === 'string'
@@ -93,11 +90,16 @@ function run(inputOrRaw, options = {}) {
   }
 
   const pluginRoot = options.pluginRoot
-    || process.env.CLAUDE_PLUGIN_ROOT
+    || env.CLAUDE_PLUGIN_ROOT
     || path.resolve(__dirname, '..', '..');
 
+  const startedAt = Date.now();
   try {
     const matches = routePrompt(prompt, { pluginRoot });
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs > budgetMs(env)) {
+      return { exitCode: 0, stdout: '', stderr: `[SkillRouter] routing took ${elapsedMs}ms, over the ${budgetMs(env)}ms budget; suppressed` };
+    }
     if (matches.length === 0) {
       return { exitCode: 0, stdout: '' };
     }
@@ -107,11 +109,6 @@ function run(inputOrRaw, options = {}) {
   }
 }
 
-/**
- * Stdin entrypoint for direct/spawnSync execution. Only runs when invoked
- * directly, never on require(), so stdin listeners are not leaked into a
- * parent that loads this hook in-process.
- */
 function main() {
   let data = '';
   process.stdin.setEncoding('utf8');
@@ -129,7 +126,7 @@ function main() {
   });
 }
 
-module.exports = { run, main };
+module.exports = { run, main, isEnabled };
 
 if (require.main === module) {
   main();
